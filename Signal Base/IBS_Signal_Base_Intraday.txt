@@ -1,0 +1,101 @@
+﻿////////////////////////////////////////////////
+// SIGNAL: IBS_Signal_Base_Intraday
+// Multi-timeframe IBS strategy
+// data(1) = Intraday bars (5-min or 15-min) for execution
+// data(2) = Daily bars for IBS calculation
+// Calculates IBS on daily, executes on intraday
+////////////////////////////////////////////////
+
+Inputs:
+    IntradayData(1),        // Data stream for execution (5-min or 15-min)
+    DailyData(2),           // Data stream for IBS calculation (daily)
+    IBSThreshold(0.2),      // IBS below this = oversold signal
+    ATRLength(14),          // ATR period for stops/targets (on daily)
+    StopATRMultiple(2.0),   // Stop loss = Entry - (ATR * this)
+    TargetATRMultiple(3.0); // Profit target = Entry + (ATR * this)
+
+Vars:
+    // IBS calculation
+    ibsValue(0),
+    dailyBarN(0),
+    prevDailyBarN(0),
+
+    // ATR for risk management
+    atrValue(0),
+
+    // Entry/Exit levels
+    entryLimit(0),
+    stopLoss(0),
+    profitTarget(0),
+
+    // Signal tracking
+    hasSignal(False);
+
+// Restricciones
+once if BarStatus(IntradayData) < 0 then
+    raiseruntimeerror("IBS Intraday Signal needs intraday datastream " + NumToStr(IntradayData, 0));
+
+once if BarStatus(DailyData) < 0 then
+    raiseruntimeerror("IBS Intraday Signal needs daily datastream " + NumToStr(DailyData, 0));
+
+once if 1 <> getappinfo(aiisportfoliomode) then
+    raiseruntimeerror("IBS Intraday Signal can be applied for MCPortfolio application only.");
+
+// ================================================
+// CALCULATE IBS ON DAILY BARS (data2)
+// ================================================
+
+dailyBarN = BarNumber of data(DailyData);
+
+If dailyBarN > prevDailyBarN then begin
+
+    // Calculate IBS on daily bar
+    ibsValue = IBS_CalculateIBS(
+        High of data(DailyData),
+        Low of data(DailyData),
+        Close of data(DailyData)
+    );
+
+    // Calculate ATR on daily bars for stop/target placement
+    atrValue = AvgTrueRange(ATRLength) of data(DailyData);
+
+    // Determine if we have an oversold signal
+    hasSignal = (ibsValue < IBSThreshold and ibsValue >= 0);
+
+    // Calculate entry levels based on IBS
+    // Lower IBS = more aggressive entry (closer to current price)
+    // Entry limit: Try to buy on a pullback within the intraday range
+    If hasSignal then begin
+        // Entry slightly below current close (scale with IBS)
+        // IBS near 0 = very oversold, enter closer to current price
+        entryLimit = Close of data(DailyData) * (1 - (0.002 * (1 - ibsValue)));
+
+        // Stop loss: ATR-based from entry
+        stopLoss = entryLimit - (atrValue * StopATRMultiple);
+
+        // Profit target: ATR-based from entry
+        profitTarget = entryLimit + (atrValue * TargetATRMultiple);
+    end
+    else begin
+        entryLimit = 0;
+        stopLoss = 0;
+        profitTarget = 0;
+    end;
+
+    // Send all values to Portfolio MM
+    pmm_set_my_named_num("IBS", ibsValue);
+    pmm_set_my_named_num("ATR", atrValue);
+    pmm_set_my_named_num("HasSignal", iff(hasSignal, 1, 0));
+    pmm_set_my_named_num("EntryLimit", entryLimit);
+    pmm_set_my_named_num("StopLoss", stopLoss);
+    pmm_set_my_named_num("ProfitTarget", profitTarget);
+
+    prevDailyBarN = dailyBarN;
+end;
+
+// ================================================
+// DUMMY ORDERS (actual orders handled by PMM)
+// ================================================
+
+buy next bar at market;
+sellshort next bar at market;

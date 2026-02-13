@@ -1,0 +1,260 @@
+﻿////////////////////////////////////////////////
+// PMM SIGNAL: IBS_Portfolio_MM_Intraday
+// Multi-timeframe IBS with intraday execution
+// LIMITATION: Portfolio Trader does NOT support true bracket orders
+// This implements a "best effort" approach with intraday signals
+////////////////////////////////////////////////
+
+Inputs:
+    TopN(1),                    // Number of assets to hold
+    UseIntradayEntry(True),     // True=wait for intraday pullback, False=enter immediately
+    UseStopLoss(True),          // Enable stop loss exits
+    UseProfitTarget(True),      // Enable profit target exits
+    VerboseMode(True);          // Show details in log
+
+Vars:
+    portfolioStrategies(0),
+    idx(0),
+
+    // IBS and signal data from Signal Base
+    ibsValue(0),
+    atrValue(0),
+    hasSignal(0),
+    entryLimit(0),
+    stopLoss(0),
+    profitTarget(0),
+
+    // Strategy tracking
+    strategyIdx(0),
+    symbolName(""),
+    currentPrice(0),
+    entryPrice(0),
+    currentPosition(0),
+
+    // Ranking
+    weightPerPosition(0),
+    positionsAllocated(0);
+
+// Arrays
+array:
+    ibsScores[2, 10000](0),
+    shouldBeInTopN[10000](False),
+    entryPrices[10000](0),         // Track entry price for stop/target
+    stopLossPrices[10000](0),
+    profitTargetPrices[10000](0);
+
+// Restricciones
+once if 1 <> getappinfo(aiisportfoliomode) then
+    raiseruntimeerror("IBS Intraday PMM can be applied for MCPortfolio application only.");
+
+once if pmms_strategies_count() > 10000 then
+    raiseruntimeerror("IBS Intraday PMM: too many instruments, max = 10000");
+
+once begin
+    portfolioStrategies = pmms_strategies_count();
+end;
+
+// ================================================
+// DENY ALL ENTRIES BY DEFAULT
+// ================================================
+
+pmms_strategies_deny_entries_all();
+
+// ================================================
+// CHECK FOR EXIT SIGNALS (RUNS EVERY INTRADAY BAR)
+// ================================================
+
+// Check existing positions for stop/target exits
+For idx = 0 to portfolioStrategies - 1 begin
+    currentPosition = pmms_strategy_marketposition(idx);
+
+    If currentPosition > 0 then begin
+        currentPrice = Close of data(1);  // Intraday close
+        symbolName = pmms_strategy_symbol(idx);
+
+        // Check stop loss
+        If UseStopLoss and stopLossPrices[idx] > 0 then begin
+            If currentPrice <= stopLossPrices[idx] then begin
+                pmms_strategy_close_position(idx);
+
+                If VerboseMode then
+                    print(Time:0:0, " STOP LOSS: ", symbolName,
+                          " | Price: ", currentPrice:0:2,
+                          " | Stop: ", stopLossPrices[idx]:0:2);
+
+                // Reset tracking
+                entryPrices[idx] = 0;
+                stopLossPrices[idx] = 0;
+                profitTargetPrices[idx] = 0;
+            end;
+        end;
+
+        // Check profit target
+        If UseProfitTarget and profitTargetPrices[idx] > 0 then begin
+            If currentPrice >= profitTargetPrices[idx] then begin
+                pmms_strategy_close_position(idx);
+
+                If VerboseMode then
+                    print(Time:0:0, " PROFIT TARGET: ", symbolName,
+                          " | Price: ", currentPrice:0:2,
+                          " | Target: ", profitTargetPrices[idx]:0:2);
+
+                // Reset tracking
+                entryPrices[idx] = 0;
+                stopLossPrices[idx] = 0;
+                profitTargetPrices[idx] = 0;
+            end;
+        end;
+    end;
+end;
+
+// ================================================
+// COLLECT IBS SIGNALS FROM ALL STRATEGIES
+// ================================================
+
+For idx = 0 to portfolioStrategies - 1 begin
+    ibsValue = pmms_get_strategy_named_num(idx, "IBS");
+    hasSignal = pmms_get_strategy_named_num(idx, "HasSignal");
+
+    ibsScores[1, idx + 1] = ibsValue;
+    ibsScores[2, idx + 1] = idx;
+
+    If VerboseMode and hasSignal = 1 then begin
+        symbolName = pmms_strategy_symbol(idx);
+        print("SIGNAL: ", symbolName, " | IBS: ", ibsValue:0:4);
+    end;
+end;
+
+// ================================================
+// RANK BY IBS (LOWEST FIRST - FIX THE BUG!)
+// ================================================
+
+If portfolioStrategies > 0 then
+    Sort2DArray(ibsScores, 2, portfolioStrategies, 1);  // 1 = ascending = lowest IBS first
+
+// ================================================
+// SELECT TOP N ASSETS
+// ================================================
+
+// Reset array
+For idx = 0 to portfolioStrategies - 1 begin
+    shouldBeInTopN[idx] = False;
+end;
+
+Vars: validTopNCount(0);
+validTopNCount = 0;
+
+For idx = 1 to portfolioStrategies begin
+    If validTopNCount >= TopN then
+        break;
+
+    strategyIdx = ibsScores[2, idx];
+    ibsValue = ibsScores[1, idx];
+    hasSignal = pmms_get_strategy_named_num(strategyIdx, "HasSignal");
+
+    // Only select if we have a valid signal
+    If hasSignal = 1 and ibsValue < 2 then begin
+        shouldBeInTopN[strategyIdx] = True;
+        validTopNCount = validTopNCount + 1;
+    end;
+end;
+
+// ================================================
+// CLOSE POSITIONS NOT IN TOP N
+// ================================================
+
+For idx = 0 to portfolioStrategies - 1 begin
+    If pmms_strategy_marketposition(idx) <> 0 then begin
+        If shouldBeInTopN[idx] = False then begin
+            pmms_strategy_close_position(idx);
+
+            If VerboseMode then
+                print(Time:0:0, " CLOSING (not in TopN): ", pmms_strategy_symbol(idx));
+
+            // Reset tracking
+            entryPrices[idx] = 0;
+            stopLossPrices[idx] = 0;
+            profitTargetPrices[idx] = 0;
+        end;
+    end;
+end;
+
+// ================================================
+// ENTER NEW POSITIONS
+// ================================================
+
+If validTopNCount > 0 then
+    weightPerPosition = 100.0 / TopN
+else
+    weightPerPosition = 0;
+
+positionsAllocated = 0;
+
+For idx = 1 to portfolioStrategies begin
+    If positionsAllocated >= TopN then
+        break;
+
+    strategyIdx = ibsScores[2, idx];
+
+    If shouldBeInTopN[strategyIdx] then begin
+        currentPosition = pmms_strategy_marketposition(strategyIdx);
+        symbolName = pmms_strategy_symbol(strategyIdx);
+        currentPrice = Close of data(1);
+
+        // Get entry/stop/target levels from Signal Base
+        entryLimit = pmms_get_strategy_named_num(strategyIdx, "EntryLimit");
+        stopLoss = pmms_get_strategy_named_num(strategyIdx, "StopLoss");
+        profitTarget = pmms_get_strategy_named_num(strategyIdx, "ProfitTarget");
+
+        // If not in position, check if we should enter
+        If currentPosition = 0 then begin
+
+            Vars: shouldEnter(False);
+            shouldEnter = False;
+
+            // Entry logic
+            If UseIntradayEntry then begin
+                // Wait for price to pull back to entry limit
+                If currentPrice <= entryLimit then
+                    shouldEnter = True;
+            end
+            else begin
+                // Enter immediately at market
+                shouldEnter = True;
+            end;
+
+            If shouldEnter then begin
+                // Calculate position size
+                pmms_strategy_set_entry_contracts(strategyIdx,
+                    IntPortion(Portfolio_Equity * weightPerPosition / 100 / currentPrice)
+                );
+
+                pmms_strategy_allow_long_entries(strategyIdx);
+
+                // Track entry for stops/targets
+                // LIMITATION: We can't set actual limit entry order, will enter at market
+                entryPrices[strategyIdx] = currentPrice;
+                stopLossPrices[strategyIdx] = stopLoss;
+                profitTargetPrices[strategyIdx] = profitTarget;
+
+                positionsAllocated = positionsAllocated + 1;
+
+                If VerboseMode then begin
+                    print("========================================");
+                    print(Time:0:0, " ENTRY SIGNAL: ", symbolName);
+                    print("IBS: ", ibsScores[1, idx]:0:4);
+                    print("Entry Price: ", currentPrice:0:2);
+                    print("Entry Limit: ", entryLimit:0:2);
+                    print("Stop Loss: ", stopLoss:0:2, " (", ((stopLoss/currentPrice - 1) * 100):0:2, "%)");
+                    print("Profit Target: ", profitTarget:0:2, " (", ((profitTarget/currentPrice - 1) * 100):0:2, "%)");
+                    print("Risk/Reward: 1:", (profitTarget - currentPrice) / (currentPrice - stopLoss):0:2);
+                    print("========================================");
+                end;
+            end;
+        end
+        else begin
+            // Already in position
+            positionsAllocated = positionsAllocated + 1;
+        end;
+    end;
+end;

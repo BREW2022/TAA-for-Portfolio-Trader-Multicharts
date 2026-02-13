@@ -1,0 +1,241 @@
+﻿////////////////////////////////////////////////
+// STRATEGY: IBS_Intraday_Bracket
+// Multi-timeframe IBS with full bracket order support
+// data(1) = Intraday bars (5-min or 15-min) for execution
+// data(2) = Daily bars for IBS calculation
+//
+// This is a REGULAR STRATEGY, NOT Portfolio Trader
+// Supports: Limit Entry + Stop Loss + Profit Target
+////////////////////////////////////////////////
+
+Inputs:
+    // IBS Parameters
+    IBSThreshold(0.2),          // IBS below this = oversold
+    IBSExitLevel(0.8),          // IBS above this = exit signal
+
+    // Entry Parameters
+    UseLimit(True),             // Use limit order vs market
+    LimitOffsetPercent(0.2),    // Enter X% below current price
+
+    // Risk Management
+    ATRLength(14),              // ATR period for stops/targets
+    StopATRMultiple(2.0),       // Stop loss = Entry - (ATR * this)
+    TargetATRMultiple(3.0),     // Profit target = Entry + (ATR * this)
+    UseTrailingStop(False),     // Enable trailing stop
+    TrailATRMultiple(1.5),      // Trailing stop distance
+
+    // Time Filters
+    StartTime(0930),            // Earliest entry time
+    EndTime(1545),              // Latest entry time (3:45 PM)
+    ExitEOD(True),              // Exit all at end of day
+
+    // Position Sizing
+    RiskPercent(1.0),           // Risk X% of account per trade
+
+    // Display
+    VerboseMode(True);          // Show details in output log
+
+Vars:
+    // IBS calculation (on daily)
+    ibsValue(0),
+    ibsValuePrev(0),
+    dailyBarN(0),
+    prevDailyBarN(0),
+
+    // ATR for risk management (on daily)
+    atrValue(0),
+
+    // Entry/Exit levels
+    entryLimitPrice(0),
+    stopLossPrice(0),
+    profitTargetPrice(0),
+    trailStopPrice(0),
+
+    // Signal flags
+    hasEntrySignal(False),
+    hasExitSignal(False),
+
+    // Entry tracking
+    actualEntryPrice(0),
+    positionShares(0),
+
+    // Time management
+    currentTime(0),
+    canTrade(False),
+
+    // Daily tracking
+    dailyHigh(0),
+    dailyLow(0),
+    dailyClose(0);
+
+// ================================================
+// CALCULATE IBS ON DAILY BARS (data2)
+// ================================================
+
+dailyBarN = BarNumber of data(2);
+
+If dailyBarN > prevDailyBarN then begin
+
+    // Get daily OHLC
+    dailyHigh = High of data(2);
+    dailyLow = Low of data(2);
+    dailyClose = Close of data(2);
+
+    // Calculate IBS
+    If dailyHigh - dailyLow > 0 then
+        ibsValue = (dailyClose - dailyLow) / (dailyHigh - dailyLow)
+    else
+        ibsValue = 0.5;  // Neutral if no range
+
+    // Calculate ATR
+    atrValue = AvgTrueRange(ATRLength) of data(2);
+
+    // Entry signal: IBS crossed below threshold
+    hasEntrySignal = (ibsValue < IBSThreshold and ibsValue >= 0);
+
+    // Exit signal: IBS crossed above exit level
+    hasExitSignal = (ibsValue > IBSExitLevel);
+
+    // Calculate entry levels
+    If hasEntrySignal then begin
+        // Limit entry: slightly below current close
+        If UseLimit then
+            entryLimitPrice = dailyClose * (1 - LimitOffsetPercent / 100)
+        else
+            entryLimitPrice = dailyClose;
+
+        // Stop loss: ATR-based
+        stopLossPrice = entryLimitPrice - (atrValue * StopATRMultiple);
+
+        // Profit target: ATR-based
+        profitTargetPrice = entryLimitPrice + (atrValue * TargetATRMultiple);
+
+        If VerboseMode then begin
+            print("========================================");
+            print("NEW IBS SIGNAL - ", Date of data(2):0:0);
+            print("IBS: ", ibsValue:0:4, " (Threshold: ", IBSThreshold:0:2, ")");
+            print("Daily Close: $", dailyClose:0:2);
+            print("ATR(", ATRLength:0:0, "): $", atrValue:0:2);
+            print("----------------------------------------");
+            print("Entry Limit: $", entryLimitPrice:0:2);
+            print("Stop Loss: $", stopLossPrice:0:2, " (-", ((1 - stopLossPrice/entryLimitPrice) * 100):0:2, "%)");
+            print("Profit Target: $", profitTargetPrice:0:2, " (+", ((profitTargetPrice/entryLimitPrice - 1) * 100):0:2, "%)");
+            print("Risk/Reward: 1:", (profitTargetPrice - entryLimitPrice) / (entryLimitPrice - stopLossPrice):0:2);
+            print("========================================");
+        end;
+    end;
+
+    ibsValuePrev = ibsValue;
+    prevDailyBarN = dailyBarN;
+end;
+
+// ================================================
+// TIME FILTER (on intraday bars - data1)
+// ================================================
+
+currentTime = Time of data(1);
+canTrade = (currentTime >= StartTime and currentTime <= EndTime);
+
+// ================================================
+// EXIT LOGIC (runs on every intraday bar)
+// ================================================
+
+// Exit at end of day
+If ExitEOD and currentTime >= 1555 then begin
+    If MarketPosition > 0 then begin
+        Sell ("EOD Exit") next bar at market;
+
+        If VerboseMode then
+            print(Time:0:0, " END OF DAY EXIT");
+    end;
+end;
+
+// Exit on IBS signal reversal
+If hasExitSignal and MarketPosition > 0 then begin
+    Sell ("IBS Exit") next bar at market;
+
+    If VerboseMode then
+        print("IBS EXIT SIGNAL - IBS: ", ibsValue:0:4, " > ", IBSExitLevel:0:2);
+end;
+
+// Trailing stop (optional)
+If UseTrailingStop and MarketPosition > 0 then begin
+    trailStopPrice = Close of data(1) - (atrValue * TrailATRMultiple);
+
+    // Update trailing stop if price moves up
+    If trailStopPrice > stopLossPrice then
+        stopLossPrice = trailStopPrice;
+end;
+
+// ================================================
+// ENTRY LOGIC (only if no position)
+// ================================================
+
+If MarketPosition = 0 and hasEntrySignal and canTrade then begin
+
+    // Calculate position size based on risk
+    // Risk = (Entry - Stop) * Shares
+    // Shares = (Account * RiskPercent) / (Entry - Stop)
+    Vars: dollarRisk(0), riskPerShare(0);
+
+    dollarRisk = NetProfit + InitialCapital;  // Current account value
+    dollarRisk = dollarRisk * (RiskPercent / 100);
+    riskPerShare = entryLimitPrice - stopLossPrice;
+
+    If riskPerShare > 0 then
+        positionShares = IntPortion(dollarRisk / riskPerShare)
+    else
+        positionShares = 1;
+
+    // Place bracket order
+    If UseLimit then begin
+        // LIMIT ENTRY + BRACKET
+        Buy ("IBS Limit") positionShares shares next bar at entryLimitPrice limit;
+
+        // Once filled, these will activate:
+        SetStopLoss(stopLossPrice);
+        SetProfitTarget(profitTargetPrice);
+
+        If VerboseMode then begin
+            print("----------------------------------------");
+            print(Time:0:0, " LIMIT ORDER PLACED");
+            print("Shares: ", positionShares:0:0);
+            print("Entry Limit: $", entryLimitPrice:0:2);
+            print("Stop: $", stopLossPrice:0:2);
+            print("Target: $", profitTargetPrice:0:2);
+            print("Risk: $", dollarRisk:0:2);
+            print("----------------------------------------");
+        end;
+    end
+    else begin
+        // MARKET ENTRY + BRACKET
+        Buy ("IBS Market") positionShares shares next bar at market;
+
+        SetStopLoss(stopLossPrice);
+        SetProfitTarget(profitTargetPrice);
+
+        If VerboseMode then
+            print(Time:0:0, " MARKET ORDER: ", positionShares:0:0, " shares");
+    end;
+
+    // Clear signal after order placement
+    hasEntrySignal = False;
+end;
+
+// ================================================
+// ON-FILL NOTIFICATION (optional)
+// ================================================
+
+If MarketPosition > 0 and MarketPosition[1] = 0 then begin
+    actualEntryPrice = EntryPrice;
+
+    If VerboseMode then begin
+        print("========================================");
+        print(Time:0:0, " FILLED!");
+        print("Entry Price: $", actualEntryPrice:0:2);
+        print("Shares: ", CurrentShares:0:0);
+        print("Stop Loss: $", stopLossPrice:0:2);
+        print("Profit Target: $", profitTargetPrice:0:2);
+        print("========================================");
+    end;
+end;
