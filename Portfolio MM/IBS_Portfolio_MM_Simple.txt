@@ -1,0 +1,154 @@
+﻿////////////////////////////////////////////////
+// PMM SIGNAL: IBS_Portfolio_MM_Simple
+// Simplified Portfolio MM for IBS intraday strategy
+// Signal Base handles all order logic (limit, stop, target)
+// Portfolio MM only handles ranking and position sizing
+////////////////////////////////////////////////
+
+Inputs:
+    TopN(1),                    // Number of assets to hold
+    VerboseMode(True);          // Show details in log
+
+Vars:
+    portfolioStrategies(0),
+    idx(0),
+
+    // IBS data from Signal Base
+    ibsValue(0),
+    hasSignal(0),
+
+    // Strategy tracking
+    strategyIdx(0),
+    symbolName(""),
+
+    // Ranking
+    weightPerPosition(0),
+    positionsAllocated(0);
+
+// Arrays
+array:
+    ibsScores[2, 10000](0),
+    shouldBeInTopN[10000](False);
+
+// Restricciones
+once if 1 <> getappinfo(aiisportfoliomode) then
+    raiseruntimeerror("IBS Simple PMM can be applied for MCPortfolio application only.");
+
+once if pmms_strategies_count() > 10000 then
+    raiseruntimeerror("IBS Simple PMM: too many instruments, max = 10000");
+
+once begin
+    portfolioStrategies = pmms_strategies_count();
+end;
+
+// ================================================
+// DENY ALL ENTRIES BY DEFAULT
+// ================================================
+
+pmms_strategies_deny_entries_all();
+
+// ================================================
+// COLLECT IBS SIGNALS FROM ALL STRATEGIES
+// ================================================
+
+For idx = 0 to portfolioStrategies - 1 begin
+    ibsValue = pmms_get_strategy_named_num(idx, "IBS");
+    hasSignal = pmms_get_strategy_named_num(idx, "HasSignal");
+
+    ibsScores[1, idx + 1] = ibsValue;
+    ibsScores[2, idx + 1] = idx;
+end;
+
+// ================================================
+// RANK BY IBS (LOWEST FIRST - CORRECTED!)
+// ================================================
+
+If portfolioStrategies > 0 then
+    Sort2DArray(ibsScores, 2, portfolioStrategies, 1);  // 1 = ascending = lowest IBS first
+
+// ================================================
+// SELECT TOP N ASSETS WITH SIGNALS
+// ================================================
+
+// Reset array
+For idx = 0 to portfolioStrategies - 1 begin
+    shouldBeInTopN[idx] = False;
+end;
+
+Vars: validTopNCount(0);
+validTopNCount = 0;
+
+For idx = 1 to portfolioStrategies begin
+    If validTopNCount >= TopN then
+        break;
+
+    strategyIdx = ibsScores[2, idx];
+    ibsValue = ibsScores[1, idx];
+    hasSignal = pmms_get_strategy_named_num(strategyIdx, "HasSignal");
+
+    // Only select if we have a valid signal
+    If hasSignal = 1 and ibsValue < 2 then begin
+        shouldBeInTopN[strategyIdx] = True;
+        validTopNCount = validTopNCount + 1;
+    end;
+end;
+
+// ================================================
+// CLOSE POSITIONS NOT IN TOP N
+// ================================================
+
+For idx = 0 to portfolioStrategies - 1 begin
+    If pmms_strategy_marketposition(idx) <> 0 then begin
+        If shouldBeInTopN[idx] = False then begin
+            pmms_strategy_close_position(idx);
+
+            If VerboseMode then begin
+                symbolName = pmms_strategy_symbol(idx);
+                print(Time:0:0, " PMM: CLOSING (not in TopN): ", symbolName);
+            end;
+        end;
+    end;
+end;
+
+// ================================================
+// ALLOW ENTRIES FOR TOP N
+// Signal Base will handle the actual order generation
+// ================================================
+
+If validTopNCount > 0 then
+    weightPerPosition = 100.0 / TopN
+else
+    weightPerPosition = 0;
+
+positionsAllocated = 0;
+
+For idx = 1 to portfolioStrategies begin
+    If positionsAllocated >= TopN then
+        break;
+
+    strategyIdx = ibsScores[2, idx];
+
+    If shouldBeInTopN[strategyIdx] then begin
+        symbolName = pmms_strategy_symbol(strategyIdx);
+
+        // Set position size
+        pmms_strategy_set_entry_contracts(strategyIdx,
+            IntPortion(Portfolio_Equity * weightPerPosition / 100 / Close)
+        );
+
+        // Allow entries - Signal Base will generate the actual limit/stop/target orders
+        pmms_strategy_allow_long_entries(strategyIdx);
+
+        positionsAllocated = positionsAllocated + 1;
+
+        If VerboseMode then begin
+            ibsValue = ibsScores[1, idx];
+            print("----------------------------------------");
+            print("PMM: ALLOWING ENTRIES for ", symbolName);
+            print("IBS: ", ibsValue:0:4, " (Rank #", positionsAllocated:0:0, ")");
+            print("Weight: ", weightPerPosition:0:2, "%");
+            print("Note: Signal Base will place limit/stop/target orders");
+            print("----------------------------------------");
+        end;
+    end;
+end;

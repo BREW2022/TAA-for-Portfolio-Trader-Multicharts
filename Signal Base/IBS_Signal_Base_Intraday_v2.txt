@@ -1,0 +1,204 @@
+﻿////////////////////////////////////////////////
+// SIGNAL: IBS_Signal_Base_Intraday_v2
+// Multi-timeframe IBS with DIRECT order management
+// data(1) = Intraday bars (5-min or 15-min) for execution
+// data(2) = Daily bars for IBS calculation
+//
+// Uses native EasyLanguage orders (limit entry, stop, target)
+// Relies on Portfolio Trader's price order emulation
+// LIMITATION: No intrabar execution (orders execute at bar close only)
+////////////////////////////////////////////////
+
+Inputs:
+    IntradayData(1),        // Data stream for execution (5-min or 15-min)
+    DailyData(2),           // Data stream for IBS calculation (daily)
+    IBSThreshold(0.2),      // IBS below this = oversold signal
+    IBSExitLevel(0.8),      // IBS above this = exit long
+    ATRLength(14),          // ATR period for stops/targets (on daily)
+    StopATRMultiple(2.0),   // Stop loss = Entry - (ATR * this)
+    TargetATRMultiple(3.0), // Profit target = Entry + (ATR * this)
+    UseLimitEntry(True),    // True=limit order, False=market order
+    LimitOffsetPercent(0.2),// Entry limit offset from daily close
+    ExitEOD(True),          // Exit all positions at end of day
+    EndTime(1555),          // Exit time (3:55 PM)
+    VerboseMode(True);      // Debug output
+
+Vars:
+    // IBS calculation (on daily)
+    ibsValue(0),
+    ibsValuePrev(0),
+    dailyBarN(0),
+    prevDailyBarN(0),
+
+    // ATR for risk management (on daily)
+    atrValue(0),
+
+    // Entry/Exit levels
+    dailyClose(0),
+    dailyHigh(0),
+    dailyLow(0),
+    entryLimitPrice(0),
+    stopLossPrice(0),
+    profitTargetPrice(0),
+
+    // Signal flags
+    hasEntrySignal(False),
+    hasExitSignal(False),
+
+    // Time management
+    currentTime(0),
+    shouldExitEOD(False);
+
+// Restricciones
+once if BarStatus(IntradayData) < 0 then
+    raiseruntimeerror("IBS Intraday Signal v2 needs intraday datastream " + NumToStr(IntradayData, 0));
+
+once if BarStatus(DailyData) < 0 then
+    raiseruntimeerror("IBS Intraday Signal v2 needs daily datastream " + NumToStr(DailyData, 0));
+
+once if 1 <> getappinfo(aiisportfoliomode) then
+    raiseruntimeerror("IBS Intraday Signal v2 can be applied for MCPortfolio application only.");
+
+// ================================================
+// CALCULATE IBS ON DAILY BARS (data2)
+// ================================================
+
+dailyBarN = BarNumber of data(DailyData);
+
+If dailyBarN > prevDailyBarN then begin
+
+    // Get daily OHLC
+    dailyHigh = High of data(DailyData);
+    dailyLow = Low of data(DailyData);
+    dailyClose = Close of data(DailyData);
+
+    // Calculate IBS
+    If dailyHigh - dailyLow > 0 then
+        ibsValue = (dailyClose - dailyLow) / (dailyHigh - dailyLow)
+    else
+        ibsValue = 0.5;  // Neutral if no range
+
+    // Calculate ATR on daily bars
+    atrValue = AvgTrueRange(ATRLength) of data(DailyData);
+
+    // Entry signal: IBS below threshold (oversold)
+    hasEntrySignal = (ibsValue < IBSThreshold and ibsValue >= 0);
+
+    // Exit signal: IBS above exit level (overbought)
+    hasExitSignal = (ibsValue > IBSExitLevel);
+
+    // Calculate order prices if we have entry signal
+    If hasEntrySignal then begin
+
+        // Entry limit: slightly below daily close for better fill
+        If UseLimitEntry then
+            entryLimitPrice = dailyClose * (1 - LimitOffsetPercent / 100)
+        else
+            entryLimitPrice = dailyClose;  // Will use market order instead
+
+        // Stop loss: ATR-based from entry
+        stopLossPrice = entryLimitPrice - (atrValue * StopATRMultiple);
+
+        // Profit target: ATR-based from entry
+        profitTargetPrice = entryLimitPrice + (atrValue * TargetATRMultiple);
+
+        If VerboseMode then begin
+            print("========================================");
+            print("IBS ENTRY SIGNAL - ", Date of data(DailyData):0:0);
+            print("IBS: ", ibsValue:0:4, " < Threshold: ", IBSThreshold:0:2);
+            print("Daily Close: $", dailyClose:0:2);
+            print("ATR(", ATRLength:0:0, "): $", atrValue:0:2);
+            print("----------------------------------------");
+            print("Entry Limit: $", entryLimitPrice:0:2);
+            print("Stop Loss: $", stopLossPrice:0:2,
+                  " (-", ((1 - stopLossPrice/entryLimitPrice) * 100):0:2, "%)");
+            print("Profit Target: $", profitTargetPrice:0:2,
+                  " (+", ((profitTargetPrice/entryLimitPrice - 1) * 100):0:2, "%)");
+            print("Risk/Reward: 1:",
+                  (profitTargetPrice - entryLimitPrice) / (entryLimitPrice - stopLossPrice):0:2);
+            print("========================================");
+        end;
+    end
+    else begin
+        // No signal - clear prices
+        entryLimitPrice = 0;
+        stopLossPrice = 0;
+        profitTargetPrice = 0;
+    end;
+
+    ibsValuePrev = ibsValue;
+    prevDailyBarN = dailyBarN;
+
+    // Send IBS value to Portfolio MM (for ranking if needed)
+    pmm_set_my_named_num("IBS", ibsValue);
+    pmm_set_my_named_num("HasSignal", iff(hasEntrySignal, 1, 0));
+end;
+
+// ================================================
+// TIME-BASED EXIT (on intraday bars - data1)
+// ================================================
+
+currentTime = Time of data(IntradayData);
+
+If ExitEOD and currentTime >= EndTime then
+    shouldExitEOD = True
+else
+    shouldExitEOD = False;
+
+// ================================================
+// ORDER GENERATION (runs on every intraday bar)
+// ================================================
+
+// Exit at end of day (CRITICAL: Portfolio Trader executes at bar close)
+If shouldExitEOD and MarketPosition > 0 then begin
+    Sell ("EOD Exit") this bar at close;
+
+    If VerboseMode then
+        print(Time:0:0, " END OF DAY EXIT");
+end;
+
+// Exit on IBS reversal signal
+If hasExitSignal and MarketPosition > 0 then begin
+    Sell ("IBS Exit") next bar at market;
+
+    If VerboseMode then
+        print("IBS EXIT SIGNAL - IBS: ", ibsValue:0:4, " > ", IBSExitLevel:0:2);
+end;
+
+// Entry orders (only if no position and we have a signal)
+If MarketPosition = 0 and hasEntrySignal and not shouldExitEOD then begin
+
+    If UseLimitEntry then begin
+        // LIMIT ENTRY with STOP and TARGET
+        // NOTE: These execute at bar close (no intrabar execution in Portfolio Trader)
+        buy next bar at entryLimitPrice limit;
+
+        // Stop loss order (will be placed after entry fills)
+        // LIMITATION: Will only check/execute at bar close
+        Sell ("Stop Loss") next bar at stopLossPrice stop;
+
+        // Profit target order (will be placed after entry fills)
+        // LIMITATION: Will only check/execute at bar close
+        Sell ("Profit Target") next bar at profitTargetPrice limit;
+
+        If VerboseMode then begin
+            print("----------------------------------------");
+            print(Time:0:0, " LIMIT ORDER PLACED");
+            print("Entry: $", entryLimitPrice:0:2, " limit");
+            print("Stop: $", stopLossPrice:0:2);
+            print("Target: $", profitTargetPrice:0:2);
+            print("NOTE: Orders execute at bar close only (no IOG)");
+            print("----------------------------------------");
+        end;
+    end
+    else begin
+        // MARKET ENTRY with STOP and TARGET
+        buy next bar at market;
+
+        Sell ("Stop Loss") next bar at stopLossPrice stop;
+        Sell ("Profit Target") next bar at profitTargetPrice limit;
+
+        If VerboseMode then
+            print(Time:0:0, " MARKET ORDER + bracket");
+    end;
+end;
