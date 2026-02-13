@@ -1,0 +1,688 @@
+﻿////////////////////////////////////////////////
+// SIGNAL: IBS_MultiFactorRanking_Advanced
+// Highly configurable multi-factor ranking system
+// - Enable/disable each factor independently
+// - Polarity switches for contrarian testing
+// - ATR-based stop/limit calculations
+// - Trailing buy stop-limit option
+// - Support-anchored stops option
+////////////////////////////////////////////////
+
+Inputs:
+    // ================================================
+    // FACTOR ENABLE/DISABLE SWITCHES (0=off, 1=on)
+    // ================================================
+    UseIBS(1),                  // IBS oversold signal
+    UseVolume(1),               // Volume spike (capitulation)
+    UseTrend(1),                // Trend filter (MA position)
+    UsePersistence(1),          // Consecutive low IBS days
+    UsePullback(1),             // Pullback depth from high
+    UseMarketRegime(1),         // SPY/VIX filter
+    UseRelativeStrength(1),     // Relative to market
+    UseVolatility(1),           // ATR percentile
+
+    // ================================================
+    // POLARITY SWITCHES (1=normal, -1=inverted)
+    // ================================================
+    // Allows testing contrarian approaches
+    IBSPolarity(1),             // 1=low IBS good, -1=high IBS good
+    VolumePolarity(1),          // 1=high vol good, -1=low vol good
+    TrendPolarity(1),           // 1=uptrend good, -1=downtrend good
+    PersistencePolarity(1),     // 1=persistent good, -1=single day good
+    PullbackPolarity(1),        // 1=moderate pullback good, -1=extreme pullback good
+    MarketRegimePolarity(1),    // 1=bull market good, -1=bear market good
+    RelativeStrengthPolarity(1),// 1=outperform good, -1=underperform good
+    VolatilityPolarity(1),      // 1=high vol good, -1=low vol good
+
+    // ================================================
+    // FACTOR WEIGHTS (must sum to 1.0 for enabled factors)
+    // ================================================
+    wIBS(0.25),
+    wVolume(0.15),
+    wTrend(0.20),
+    wPersistence(0.10),
+    wPullback(0.10),
+    wMarketRegime(0.10),
+    wRelativeStrength(0.05),
+    wVolatility(0.05),
+
+    // ================================================
+    // FACTOR PARAMETERS
+    // ================================================
+    IBSThreshold(0.2),          // Signal threshold
+    VolumeLookback(20),
+    TrendMA(50),
+    HighLookback(50),
+    RSLookback(60),
+    ATRPercentileLookback(100),
+
+    // ================================================
+    // ATR CONFIGURATION
+    // ================================================
+    ATRLength(14),              // ATR calculation period
+    ATRSource(2),               // 1=intraday data1, 2=daily data2
+
+    // ================================================
+    // ENTRY ORDER CONFIGURATION
+    // ================================================
+    EntryOrderType(2),          // 0=Market, 1=Limit, 2=Stop, 3=Stop-Limit
+
+    // For Stop or Stop-Limit entries:
+    StopOffsetATR(0.2),         // Stop trigger: Close + (ATR * this)
+    StopOffsetPct(0.2),         // OR: Close * (1 + this%)
+    UseATRForStop(True),        // True=use ATR, False=use percent
+
+    // For Limit or Stop-Limit entries:
+    LimitOffsetATR(0.5),        // Limit cap: StopPrice + (ATR * this)
+    LimitOffsetPct(0.5),        // OR: StopPrice * (1 + this%)
+    UseATRForLimit(True),       // True=use ATR, False=use percent
+
+    // ================================================
+    // TRAILING BUY STOP-LIMIT (Advanced Feature)
+    // ================================================
+    UseTrailingEntry(False),    // Enable trailing stop-limit down
+    TrailTriggerPct(0.5),       // Trail if price drops X% from initial
+    TrailStepATR(0.1),          // Adjust by this * ATR per step
+    TrailMaxRangeATR(2.0),      // Max trail distance: ATR * this
+    TrailMaxRangePct(3.0),      // OR: Max X% below initial
+    UseATRForTrailRange(True),  // True=use ATR, False=use percent
+
+    // ================================================
+    // STOP LOSS CONFIGURATION
+    // ================================================
+    StopLossMethod(0),          // 0=ATR-based, 1=Support-based, 2=Hybrid
+    StopLossATRMultiple(2.0),   // ATR method: Entry - (ATR * this)
+    SupportLookback(5),         // Support: Lowest low of last N days
+    SupportBuffer(0.002),       // Support: Low * (1 - this)
+    UseWorstCase(True),         // Hybrid: Use wider of ATR/Support
+
+    // ================================================
+    // PROFIT TARGET CONFIGURATION
+    // ================================================
+    TargetATRMultiple(3.0),     // Entry + (ATR * this)
+
+    // ================================================
+    // RISK MANAGEMENT
+    // ================================================
+    MaxRiskPercent(5.0),        // Max risk per trade (entry to stop)
+    MinRiskReward(1.5),         // Minimum R:R ratio to take trade
+
+    // ================================================
+    // DISPLAY
+    // ================================================
+    VerboseMode(True),
+    ShowFactorBreakdown(True);
+
+Vars:
+    // ================================================
+    // DATA TRACKING
+    // ================================================
+    dailyBarN(0),
+    prevDailyBarN(0),
+
+    // ================================================
+    // FACTOR SCORES (0 to 1)
+    // ================================================
+    ibsScore(0),
+    volumeScore(0),
+    trendScore(0),
+    persistenceScore(0),
+    pullbackScore(0),
+    marketRegimeScore(0),
+    rsScore(0),
+    volatilityScore(0),
+
+    // Composite
+    compositeScore(0),
+    totalWeight(0),
+    normalizedWeight(0),
+
+    // ================================================
+    // RAW CALCULATIONS
+    // ================================================
+    ibsValue(0),
+    volumeRatio(0),
+    distanceFromMA(0),
+    consecutiveLowIBS(0),
+    pullbackPct(0),
+    relativeStrength(0),
+    atrPercentile(0),
+
+    // ================================================
+    // ATR VALUES
+    // ================================================
+    atrValue(0),
+    atrIntraday(0),
+    atrDaily(0),
+
+    // ================================================
+    // ORDER PRICES
+    // ================================================
+    dailyClose(0),
+    initialStopPrice(0),
+    initialLimitPrice(0),
+    currentStopPrice(0),
+    currentLimitPrice(0),
+    stopLossPrice(0),
+    profitTargetPrice(0),
+
+    // ================================================
+    // TRAILING LOGIC
+    // ================================================
+    trailActivated(False),
+    trailBasePrice(0),
+    trailCurrentLow(0),
+    trailMaxDistance(0),
+
+    // ================================================
+    // SUPPORT LEVELS
+    // ================================================
+    supportLevel(0),
+    recentLow(0),
+
+    // ================================================
+    // RISK METRICS
+    // ================================================
+    entryPrice(0),
+    riskAmount(0),
+    rewardAmount(0),
+    riskRewardRatio(0),
+    riskPercent(0),
+
+    // ================================================
+    // SIGNAL FLAGS
+    // ================================================
+    hasSignal(False),
+    signalQualifies(False);
+
+// Restricciones
+once if BarStatus(1) < 0 then
+    raiseruntimeerror("IBS Multi-Factor needs data(1) - intraday bars");
+once if BarStatus(2) < 0 then
+    raiseruntimeerror("IBS Multi-Factor needs data(2) - daily bars");
+once if 1 <> getappinfo(aiisportfoliomode) then
+    raiseruntimeerror("IBS Multi-Factor can be applied for MCPortfolio application only.");
+
+// ================================================
+// CALCULATE ON DAILY BAR CLOSE
+// ================================================
+
+dailyBarN = BarNumber of data(2);
+
+If dailyBarN > prevDailyBarN then begin
+
+    dailyClose = Close of data(2);
+
+    // ================================================
+    // CALCULATE ATR (from selected source)
+    // ================================================
+
+    atrDaily = AvgTrueRange(ATRLength) of data(2);
+    atrIntraday = AvgTrueRange(ATRLength) of data(1);
+
+    If ATRSource = 2 then
+        atrValue = atrDaily
+    else
+        atrValue = atrIntraday;
+
+    // ================================================
+    // FACTOR 1: IBS
+    // ================================================
+
+    Vars: dailyHigh(0), dailyLow(0), dailyRange(0);
+
+    dailyHigh = High of data(2);
+    dailyLow = Low of data(2);
+    dailyRange = dailyHigh - dailyLow;
+
+    If dailyRange > 0 then
+        ibsValue = (dailyClose - dailyLow) / dailyRange
+    else
+        ibsValue = 0.5;
+
+    If UseIBS = 1 then begin
+        ibsScore = 1 - ibsValue;  // Lower IBS = higher score
+
+        // Apply polarity
+        If IBSPolarity = -1 then
+            ibsScore = 1 - ibsScore;  // Invert: high IBS = higher score
+    end
+    else
+        ibsScore = 0.5;  // Neutral if disabled
+
+    // ================================================
+    // FACTOR 2: VOLUME SPIKE
+    // ================================================
+
+    If UseVolume = 1 then begin
+        volumeRatio = Volume of data(2) / Average(Volume of data(2), VolumeLookback);
+        volumeScore = MinList(volumeRatio / 2.0, 1.0);
+
+        If VolumePolarity = -1 then
+            volumeScore = 1 - volumeScore;  // Invert: low volume = higher score
+    end
+    else
+        volumeScore = 0.5;
+
+    // ================================================
+    // FACTOR 3: TREND FILTER
+    // ================================================
+
+    If UseTrend = 1 then begin
+        distanceFromMA = (Close of data(2) / Average(Close of data(2), TrendMA) - 1) * 100;
+
+        If distanceFromMA > 5 then
+            trendScore = 1.0
+        else If distanceFromMA > 0 then
+            trendScore = 0.8
+        else If distanceFromMA > -5 then
+            trendScore = 0.4
+        else
+            trendScore = 0.0;
+
+        If TrendPolarity = -1 then
+            trendScore = 1 - trendScore;  // Invert: downtrend = higher score
+    end
+    else
+        trendScore = 0.5;
+
+    // ================================================
+    // FACTOR 4: PERSISTENCE (Consecutive Low IBS)
+    // ================================================
+
+    If UsePersistence = 1 then begin
+        Vars: ibs1(0), ibs2(0);
+
+        ibs1 = (Close[1] of data(2) - Low[1] of data(2)) /
+               (High[1] of data(2) - Low[1] of data(2));
+        ibs2 = (Close[2] of data(2) - Low[2] of data(2)) /
+               (High[2] of data(2) - Low[2] of data(2));
+
+        consecutiveLowIBS = 0;
+        If ibsValue < 0.2 then consecutiveLowIBS = consecutiveLowIBS + 1;
+        If ibs1 < 0.2 then consecutiveLowIBS = consecutiveLowIBS + 1;
+        If ibs2 < 0.2 then consecutiveLowIBS = consecutiveLowIBS + 1;
+
+        persistenceScore = MinList(consecutiveLowIBS / 3.0, 1.0);
+
+        If PersistencePolarity = -1 then
+            persistenceScore = 1 - persistenceScore;  // Invert: single day = higher score
+    end
+    else
+        persistenceScore = 0.5;
+
+    // ================================================
+    // FACTOR 5: PULLBACK DEPTH
+    // ================================================
+
+    If UsePullback = 1 then begin
+        pullbackPct = (Close of data(2) / Highest(High of data(2), HighLookback) - 1) * 100;
+
+        If pullbackPct > -5 then
+            pullbackScore = 0.3
+        else If pullbackPct > -10 then
+            pullbackScore = 1.0
+        else If pullbackPct > -15 then
+            pullbackScore = 0.8
+        else If pullbackPct > -20 then
+            pullbackScore = 0.5
+        else
+            pullbackScore = 0.2;
+
+        If PullbackPolarity = -1 then
+            pullbackScore = 1 - pullbackScore;  // Invert: deep pullback = higher score
+    end
+    else
+        pullbackScore = 0.5;
+
+    // ================================================
+    // FACTOR 6: MARKET REGIME (simplified for now)
+    // ================================================
+
+    If UseMarketRegime = 1 then begin
+        // Placeholder - would need SPY/VIX data
+        marketRegimeScore = 0.7;  // Assume neutral market
+
+        If MarketRegimePolarity = -1 then
+            marketRegimeScore = 1 - marketRegimeScore;
+    end
+    else
+        marketRegimeScore = 0.5;
+
+    // ================================================
+    // FACTOR 7: RELATIVE STRENGTH (simplified)
+    // ================================================
+
+    If UseRelativeStrength = 1 then begin
+        // Placeholder - would need SPY data
+        rsScore = 0.6;  // Assume slight outperformance
+
+        If RelativeStrengthPolarity = -1 then
+            rsScore = 1 - rsScore;
+    end
+    else
+        rsScore = 0.5;
+
+    // ================================================
+    // FACTOR 8: VOLATILITY (ATR Percentile)
+    // ================================================
+
+    If UseVolatility = 1 then begin
+        atrPercentile = PercentRank(atrValue, atrValue, ATRPercentileLookback);
+
+        If atrPercentile > 0.8 then
+            volatilityScore = 1.0
+        else If atrPercentile > 0.5 then
+            volatilityScore = 0.7
+        else
+            volatilityScore = 0.3;
+
+        If VolatilityPolarity = -1 then
+            volatilityScore = 1 - volatilityScore;
+    end
+    else
+        volatilityScore = 0.5;
+
+    // ================================================
+    // CALCULATE COMPOSITE SCORE
+    // ================================================
+
+    // Calculate total active weight
+    totalWeight = 0;
+    If UseIBS = 1 then totalWeight = totalWeight + wIBS;
+    If UseVolume = 1 then totalWeight = totalWeight + wVolume;
+    If UseTrend = 1 then totalWeight = totalWeight + wTrend;
+    If UsePersistence = 1 then totalWeight = totalWeight + wPersistence;
+    If UsePullback = 1 then totalWeight = totalWeight + wPullback;
+    If UseMarketRegime = 1 then totalWeight = totalWeight + wMarketRegime;
+    If UseRelativeStrength = 1 then totalWeight = totalWeight + wRelativeStrength;
+    If UseVolatility = 1 then totalWeight = totalWeight + wVolatility;
+
+    // Normalize weights
+    If totalWeight > 0 then begin
+        compositeScore = (
+            (ibsScore * wIBS * UseIBS) +
+            (volumeScore * wVolume * UseVolume) +
+            (trendScore * wTrend * UseTrend) +
+            (persistenceScore * wPersistence * UsePersistence) +
+            (pullbackScore * wPullback * UsePullback) +
+            (marketRegimeScore * wMarketRegime * UseMarketRegime) +
+            (rsScore * wRelativeStrength * UseRelativeStrength) +
+            (volatilityScore * wVolatility * UseVolatility)
+        ) / totalWeight * 100;
+    end
+    else
+        compositeScore = 50;  // Neutral if all disabled
+
+    // ================================================
+    // GENERATE SIGNAL
+    // ================================================
+
+    hasSignal = (ibsValue < IBSThreshold);
+
+    // ================================================
+    // CALCULATE INITIAL ORDER PRICES
+    // ================================================
+
+    If hasSignal then begin
+
+        // ================================================
+        // STOP PRICE (for stop or stop-limit entries)
+        // ================================================
+
+        If UseATRForStop then
+            initialStopPrice = dailyClose + (atrValue * StopOffsetATR)
+        else
+            initialStopPrice = dailyClose * (1 + StopOffsetPct / 100);
+
+        // ================================================
+        // LIMIT PRICE (for limit or stop-limit entries)
+        // ================================================
+
+        If UseATRForLimit then
+            initialLimitPrice = initialStopPrice + (atrValue * LimitOffsetATR)
+        else
+            initialLimitPrice = initialStopPrice * (1 + LimitOffsetPct / 100);
+
+        // ================================================
+        // STOP LOSS PRICE
+        // ================================================
+
+        // Get support level
+        recentLow = Lowest(Low of data(2), SupportLookback);
+        supportLevel = recentLow * (1 - SupportBuffer);
+
+        // Calculate stop based on method
+        If StopLossMethod = 0 then begin
+            // ATR-based
+            stopLossPrice = initialStopPrice - (atrValue * StopLossATRMultiple);
+        end
+        else If StopLossMethod = 1 then begin
+            // Support-based
+            stopLossPrice = supportLevel;
+        end
+        else begin
+            // Hybrid: use worse (wider stop)
+            Vars: atrStop(0), supportStop(0);
+
+            atrStop = initialStopPrice - (atrValue * StopLossATRMultiple);
+            supportStop = supportLevel;
+
+            If UseWorstCase then
+                stopLossPrice = MinList(atrStop, supportStop)  // Wider stop
+            else
+                stopLossPrice = MaxList(atrStop, supportStop); // Tighter stop
+        end;
+
+        // ================================================
+        // PROFIT TARGET PRICE
+        // ================================================
+
+        profitTargetPrice = initialStopPrice + (atrValue * TargetATRMultiple);
+
+        // ================================================
+        // RISK/REWARD CHECK
+        // ================================================
+
+        riskAmount = initialStopPrice - stopLossPrice;
+        rewardAmount = profitTargetPrice - initialStopPrice;
+
+        If riskAmount > 0 then
+            riskRewardRatio = rewardAmount / riskAmount
+        else
+            riskRewardRatio = 0;
+
+        riskPercent = (riskAmount / initialStopPrice) * 100;
+
+        // Check if trade qualifies
+        signalQualifies = (riskRewardRatio >= MinRiskReward) AND
+                         (riskPercent <= MaxRiskPercent);
+
+        // Initialize trailing
+        If UseTrailingEntry then begin
+            trailActivated = False;
+            trailBasePrice = dailyClose;
+            currentStopPrice = initialStopPrice;
+            currentLimitPrice = initialLimitPrice;
+
+            If UseATRForTrailRange then
+                trailMaxDistance = atrValue * TrailMaxRangeATR
+            else
+                trailMaxDistance = trailBasePrice * (TrailMaxRangePct / 100);
+        end
+        else begin
+            currentStopPrice = initialStopPrice;
+            currentLimitPrice = initialLimitPrice;
+        end;
+
+    end;  // If hasSignal
+
+    // ================================================
+    // SEND DATA TO PORTFOLIO MM
+    // ================================================
+
+    pmm_set_my_named_num("CompositeScore", compositeScore);
+    pmm_set_my_named_num("IBS", ibsValue);
+    pmm_set_my_named_num("HasSignal", iff(hasSignal AND signalQualifies, 1, 0));
+    pmm_set_my_named_num("StopPrice", currentStopPrice);
+    pmm_set_my_named_num("LimitPrice", currentLimitPrice);
+    pmm_set_my_named_num("StopLoss", stopLossPrice);
+    pmm_set_my_named_num("ProfitTarget", profitTargetPrice);
+
+    // ================================================
+    // VERBOSE OUTPUT (Daily Bar)
+    // ================================================
+
+    If VerboseMode AND hasSignal then begin
+        print("========================================");
+        print("MULTI-FACTOR SIGNAL: ", GetSymbolName);
+        print("Date: ", Date of data(2):0:0);
+        print("========================================");
+
+        If ShowFactorBreakdown then begin
+            print("FACTOR SCORES:");
+            If UseIBS = 1 then
+                print("  IBS: ", ibsScore*100:0:1, "/100 (", ibsValue:0:4,
+                      ") [", iff(IBSPolarity=1,"normal","INVERTED"), "]");
+            If UseVolume = 1 then
+                print("  Volume: ", volumeScore*100:0:1, "/100 (", volumeRatio:0:2, "x avg)");
+            If UseTrend = 1 then
+                print("  Trend: ", trendScore*100:0:1, "/100 (", distanceFromMA:0:1, "% from MA)");
+            If UsePersistence = 1 then
+                print("  Persist: ", persistenceScore*100:0:1, "/100 (", consecutiveLowIBS:0:0, " days)");
+            If UsePullback = 1 then
+                print("  Pullback: ", pullbackScore*100:0:1, "/100 (", pullbackPct:0:1, "% from high)");
+            print("----------------------------------------");
+        end;
+
+        print("COMPOSITE SCORE: ", compositeScore:0:1, "/100");
+        print("----------------------------------------");
+        print("ORDER PRICES:");
+        print("  Stop Entry: $", currentStopPrice:0:2);
+        print("  Limit Cap: $", currentLimitPrice:0:2);
+        print("  Stop Loss: $", stopLossPrice:0:2,
+              " (method:", StopLossMethod:0:0, ")");
+        print("  Target: $", profitTargetPrice:0:2);
+        print("----------------------------------------");
+        print("RISK METRICS:");
+        print("  Risk: $", riskAmount:0:2, " (", riskPercent:0:2, "%)");
+        print("  Reward: $", rewardAmount:0:2);
+        print("  R:R: 1:", riskRewardRatio:0:2);
+        print("  Qualifies: ", iff(signalQualifies, "YES", "NO"));
+        print("========================================");
+    end;
+
+    prevDailyBarN = dailyBarN;
+
+end;  // If new daily bar
+
+// ================================================
+// TRAILING STOP-LIMIT LOGIC (On Intraday Bars)
+// ================================================
+
+If UseTrailingEntry AND hasSignal AND signalQualifies then begin
+
+    Vars: intradayClose(0), priceDrop(0), newStopPrice(0), newLimitPrice(0);
+
+    intradayClose = Close of data(1);
+
+    // Check if price has dropped enough to activate trailing
+    If NOT trailActivated then begin
+        priceDrop = ((trailBasePrice - intradayClose) / trailBasePrice) * 100;
+
+        If priceDrop >= TrailTriggerPct then begin
+            trailActivated = True;
+
+            If VerboseMode then
+                print(Time:0:0, " TRAILING ACTIVATED - Price drop: ", priceDrop:0:2, "%");
+        end;
+    end;
+
+    // If trailing is active, adjust stop/limit downward
+    If trailActivated then begin
+
+        // Calculate new stop based on current intraday price
+        If UseATRForStop then
+            newStopPrice = intradayClose + (atrValue * StopOffsetATR)
+        else
+            newStopPrice = intradayClose * (1 + StopOffsetPct / 100);
+
+        // Calculate new limit
+        If UseATRForLimit then
+            newLimitPrice = newStopPrice + (atrValue * LimitOffsetATR)
+        else
+            newLimitPrice = newStopPrice * (1 + LimitOffsetPct / 100);
+
+        // Check if we've exceeded max trail distance
+        Vars: trailDistance(0), withinRange(False);
+
+        trailDistance = trailBasePrice - newStopPrice;
+        withinRange = (trailDistance <= trailMaxDistance);
+
+        // Only trail down if:
+        // 1. New stop is lower than current stop (price going down)
+        // 2. Within max trail range
+        If newStopPrice < currentStopPrice AND withinRange then begin
+
+            currentStopPrice = newStopPrice;
+            currentLimitPrice = newLimitPrice;
+
+            // Update stop loss to track entry
+            stopLossPrice = currentStopPrice - (atrValue * StopLossATRMultiple);
+
+            // Recalculate R:R
+            riskAmount = currentStopPrice - stopLossPrice;
+            rewardAmount = profitTargetPrice - currentStopPrice;
+
+            If riskAmount > 0 then
+                riskRewardRatio = rewardAmount / riskAmount;
+
+            If VerboseMode then begin
+                print(Time:0:0, " TRAILING: Stop→$", currentStopPrice:0:2,
+                      " Limit→$", currentLimitPrice:0:2,
+                      " R:R→1:", riskRewardRatio:0:2);
+            end;
+
+            // Update values sent to Portfolio MM
+            pmm_set_my_named_num("StopPrice", currentStopPrice);
+            pmm_set_my_named_num("LimitPrice", currentLimitPrice);
+            pmm_set_my_named_num("StopLoss", stopLossPrice);
+        end
+        else If NOT withinRange AND VerboseMode then begin
+            print(Time:0:0, " TRAIL LIMIT REACHED - Distance: $", trailDistance:0:2,
+                  " vs Max: $", trailMaxDistance:0:2);
+        end;
+
+    end;
+
+end;
+
+// ================================================
+// ORDER GENERATION (On Intraday Bars)
+// ================================================
+
+If MarketPosition = 0 AND hasSignal AND signalQualifies then begin
+
+    // Place order based on EntryOrderType
+    If EntryOrderType = 0 then begin
+        // Market order
+        buy next bar at market;
+    end
+    else If EntryOrderType = 1 then begin
+        // Limit order only
+        buy next bar at currentLimitPrice limit;
+    end
+    else If EntryOrderType = 2 then begin
+        // Stop order only
+        buy next bar at currentStopPrice stop;
+    end
+    else If EntryOrderType = 3 then begin
+        // Stop-Limit order (RECOMMENDED)
+        buy next bar at currentStopPrice stop currentLimitPrice limit;
+    end;
+
+    // Bracket orders
+    Sell ("Stop Loss") next bar at stopLossPrice stop;
+    Sell ("Profit Target") next bar at profitTargetPrice limit;
+
+end;
